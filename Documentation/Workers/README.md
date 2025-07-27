@@ -1,0 +1,1 @@
+An worker can execute [[Jobs]] based on its capabilities and store
