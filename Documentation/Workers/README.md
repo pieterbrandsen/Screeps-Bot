@@ -30,4 +30,3 @@ An Melee Attacker can execute close combat tasks on enemy creeps.
 ## Healer
 
 An Healer can execute healing tasks on itself and other creeps.
-

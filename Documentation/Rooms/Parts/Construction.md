@@ -17,7 +17,6 @@ Storage capacity at the source job site
 Storage capacity at the controller job site
 When unlocked > Storage capacity at the mineral job site
 
-
 ### Remote Mining
 
 Containers at the source job site
