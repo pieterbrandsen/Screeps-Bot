@@ -14,6 +14,7 @@ An room must oversee its parts based on type
 ### Global Parts
 
 - [Defense](Parts/Defense.md)
+- [Room Visuals](Parts/RoomVisuals.md)
 
 ### Owned Parts
 
