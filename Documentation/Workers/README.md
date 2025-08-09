@@ -12,7 +12,7 @@ An creep will be defined as an Worker.
 
 ## Worker
 
-An Worker can execute resource gather and usage tasks with limited moving capabilities.
+An Worker can execute resource gather and usage [tasks](Tasks.md) with limited moving capabilities.
 It can for example mine or upgrade with its energy.
 
 ### Typical Tasks
