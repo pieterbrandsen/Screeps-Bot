@@ -15,3 +15,4 @@ Each room will get overseen by some system classes that monitor it needs and act
 1. Process [Jobs](Jobs/README.md)
 2. Process [Rooms](Rooms/README.md)
 3. Process [Workers](Workers/README.md)
+4. Process [Stats](Stats/README.md)
