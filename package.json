@@ -1,0 +1,18 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "rollup -c",
+    "deploy:main": "rollup -c --environment DEST:main",
+    "deploy:main:watch": "rollup -cw --environment DEST:main",
+    "deploy:pserver": "rollup -c --environment DEST:pserver",
+    "deploy:pserver:watch": "rollup -cw --environment DEST:pserver"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.0",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@types/screeps": "^3.3.8",
+    "rollup": "^4.54.0",
+    "rollup-plugin-clear": "^2.0.7",
+    "rollup-plugin-screeps": "^1.0.1"
+  }
+}
