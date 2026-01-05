@@ -1,5 +1,4 @@
-﻿import JobsManager from "../../jobs/jobsManager.js";
-import Constants from '../../utils/constants.js';
+﻿import JobParts from '../../utils/jobParts.js';
 
 export default class SourcesPartHandler {
     constructor(source, room, jobsRoomPartHandler) {
@@ -67,6 +66,9 @@ export default class SourcesPartHandler {
         }
 
         if (maxCreepAssignments === undefined) {
+            const harvestSpots = this.countHarvestSpots();
+            maxCreepAssignments = harvestSpots;
+        } else {
             const harvestSpots = this.countHarvestSpots();
             maxCreepAssignments = Math.min(maxCreepAssignments, harvestSpots);
         }

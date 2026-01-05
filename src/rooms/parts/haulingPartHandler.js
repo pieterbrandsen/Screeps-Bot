@@ -60,10 +60,6 @@ export default class HaulingPartHandler {
         return RoomTravel.estimateRoundTripTicks(this.room, pickupPos);
     }
 
-    estimateOneWayTime(pickupPos) {
-        if (!pickupPos || pickupPos.roomName !== this.room.name) return 25;
-        return RoomTravel.estimateOneWayTicks(this.room, pickupPos);
-    }
 
     getSoftHaulDemand(pickupPos, backlogAmount, existingJob) {
         const congestionScore = this.getCongestionScore();
@@ -127,61 +123,20 @@ export default class HaulingPartHandler {
     }
 
     cleanupCompletedJobs() {
-        const pickupJobs = this.jobsRoomPartHandler.getJobsByType('pickup');
-
+        const deliveryJobs = this.jobsRoomPartHandler.getJobsByType('delivery') || [];
+        // Prune hidden pickup jobs created for prediction (no longer attached to delivery jobs)
+        const pickupJobs = this.jobsRoomPartHandler.getJobsByType('pickup') || [];
         for (const job of pickupJobs) {
-            // Legacy cleanup: scheduled per-harvester haul jobs are no longer used.
-            if (job.resourceType === 'harvester-drop') {
+            // Only handle hidden prediction pickups created by this part
+            if (!job.hidden) continue;
+
+            const reserved = job.totalReserved || 0;
+            const hasReservations = job.reservations && Object.keys(job.reservations).length > 0;
+            const amount = job.amount || 0;
+
+            // Delete if nothing left and no reservations
+            if (amount <= 0 && reserved === 0 && !hasReservations) {
                 this.deleteJob(job);
-                continue;
-            }
-
-            // Persistent per-source jobs should not be auto-deleted.
-            if (job.resourceType === 'source') {
-                continue;
-            }
-
-            // For dropped resources and structures, we MUST have an objectId to track them
-            if (job.resourceType === 'dropped' || job.resourceType === 'structure') {
-                if (!job.objectId) {
-                    // Missing objectId - this job is broken, delete it immediately
-                    this.deleteJob(job);
-                    continue;
-                }
-
-                const target = Game.getObjectById(job.objectId);
-
-                // If it's a dropped resource, check if it still exists
-                if (job.resourceType === 'dropped') {
-                    if (!target || target.amount === 0) {
-                        // Resource is gone, delete job
-                        this.deleteJob(job);
-                        continue;
-                    }
-                }
-
-                // If it's a container/storage, check if it has energy
-                if (job.resourceType === 'structure') {
-                    if (!target || target.store.getUsedCapacity(RESOURCE_ENERGY) === 0) {
-                        this.deleteJob(job);
-                        continue;
-                    }
-                }
-            }
-
-            // Check if job has been idle with no assignments for too long
-            const assignedCount = Object.keys(job.assignedCreepIds || {}).length;
-            const pendingCount = Object.keys(job.pendingCreepIds || {}).length;
-
-            if (assignedCount === 0 && pendingCount === 0) {
-                if (!job.lastUnassignedTime) {
-                    job.lastUnassignedTime = Game.time;
-                } else if (Game.time - job.lastUnassignedTime > 50) {
-                    // Job has been idle for 50 ticks, likely not needed
-                    this.deleteJob(job);
-                }
-            } else {
-                job.lastUnassignedTime = null;
             }
         }
     }
@@ -210,6 +165,16 @@ export default class HaulingPartHandler {
             const jobId = `${this.room.name}-delivery-spawn-core`;
             const existingJob = this.jobsRoomPartHandler.getJobById(jobId);
 
+            // Determine desired hauling capacity in terms of carry parts
+            const desiredCarryParts = Math.max(1, Math.ceil(spawnCoreFreeCapacity / 50));
+            const carryPairs = this.getHaulerCarryPairsEstimate();
+            const desiredHaulers = Math.max(1, Math.ceil(desiredCarryParts / carryPairs));
+
+            const wanted = {
+                CARRY: desiredCarryParts,
+                MOVE: desiredCarryParts
+            };
+
             const jobData = {
                 id: jobId,
                 type: 'delivery',
@@ -218,7 +183,8 @@ export default class HaulingPartHandler {
                 creepType: 'hauler',
                 startRoom: this.room.name,
                 capacityType: 'fixed',
-                wantedCreepParts: {},  // No spawning - only accept existing haulers
+                wantedCreepParts: wanted,
+                maxCreepAssignments: desiredHaulers,
                 minJobTime: 0,
                 freeCapacity: spawnCoreFreeCapacity
             };
@@ -228,7 +194,8 @@ export default class HaulingPartHandler {
             } else {
                 this.jobsRoomPartHandler.updateJob(jobId, {
                     wantedCreepParts: jobData.wantedCreepParts,
-                    freeCapacity: jobData.freeCapacity
+                    freeCapacity: jobData.freeCapacity,
+                    maxCreepAssignments: jobData.maxCreepAssignments
                 });
             }
         } else {
@@ -245,13 +212,13 @@ export default class HaulingPartHandler {
         const sources = this.room.find(FIND_SOURCES);
         if (!sources || sources.length === 0) return;
 
-        const spawnsNeedEnergy = this.room.find(FIND_MY_SPAWNS, {
-            filter: s => s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-        }).length > 0;
-
-        const extensionsNeedEnergy = this.room.find(FIND_MY_STRUCTURES, {
-            filter: s => s.structureType === STRUCTURE_EXTENSION && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-        }).length > 0;
+        // Compute delivery job free capacities to allocate pickup jobs against.
+        const deliveryJobs = this.jobsRoomPartHandler.getJobsByType('delivery') || [];
+        const deliveryFreeById = {};
+        for (const dj of deliveryJobs) {
+            deliveryFreeById[dj.id] = dj.freeCapacity || 0;
+        }
+        let remainingDeliveryFree = Object.values(deliveryFreeById).reduce((s, v) => s + v, 0);
 
         for (const source of sources) {
             const container = this._findSourceContainer(source);
@@ -315,8 +282,8 @@ export default class HaulingPartHandler {
                 }
             }
 
-            // Only create/update job if there's actual energy to haul OR harvester needs pickup
-            if (backlogAmount === 0 && !harvesterNeedsPickup) {
+            // Only create/update job if there's actual energy to haul
+            if (backlogAmount === 0) {
                 // Delete job if it exists but has no energy
                 if (existingJob) {
                     this.deleteJob(existingJob);
@@ -324,39 +291,65 @@ export default class HaulingPartHandler {
                 continue;
             }
 
+            // If there's no delivery capacity at all, don't create pickup jobs.
+            if (remainingDeliveryFree <= 0) {
+                if (existingJob) this.deleteJob(existingJob);
+                continue;
+            }
+
+            // Find a delivery job with available free capacity to assign this pickup to.
+            let chosenDeliveryId = null;
+            for (const id in deliveryFreeById) {
+                if (deliveryFreeById[id] > 0) {
+                    chosenDeliveryId = id;
+                    break;
+                }
+            }
+
+            if (!chosenDeliveryId) {
+                if (existingJob) this.deleteJob(existingJob);
+                continue;
+            }
+
+            // Allocate amount to deliver (don't exceed delivery free capacity)
+            const alloc = Math.min(backlogAmount, deliveryFreeById[chosenDeliveryId], remainingDeliveryFree);
+            if (alloc <= 0) {
+                if (existingJob) this.deleteJob(existingJob);
+                continue;
+            }
+
             const demand = this.getSoftHaulDemand(pickupPos, backlogAmount, existingJob);
 
+            // Create a hidden pickup job for this source so delivery jobs can reserve from it
+            const pickupJobId = `pickup-source-${source.id}`;
+            const existingPickup = this.jobsRoomPartHandler.getJobById(pickupJobId);
             const jobData = {
-                id: jobId,
-                objectId: container ? container.id : null,
+                id: pickupJobId,
                 type: 'pickup',
-                resourceType: 'source',
                 resource: RESOURCE_ENERGY,
                 creepType: 'hauler',
                 startRoom: this.room.name,
+                amount: alloc,
+                objectId: container ? container.id : null,
                 targetPos: { x: pickupPos.x, y: pickupPos.y, roomName: pickupPos.roomName },
-                amount: backlogAmount,
-                capacityType: 'fixed',
-                maxCreepAssignments: demand.desiredHaulers,
-                wantedCreepParts: { CARRY: demand.wantedCarryParts, MOVE: demand.wantedCarryParts },
-                minJobTime: 0,
-                ticksToClear: demand.ticksToClear,
-                roundTripTime: demand.roundTripTime
+                hidden: true,
+                deliveryJobId: chosenDeliveryId,
+                wantedCreepParts: {} // do not request spawns
             };
 
-            if (!existingJob) {
+            if (!existingPickup) {
                 this.jobsRoomPartHandler.createJob(jobData);
             } else {
-                this.jobsRoomPartHandler.updateJob(jobId, {
-                    objectId: jobData.objectId,
-                    targetPos: jobData.targetPos,
+                this.jobsRoomPartHandler.updateJob(pickupJobId, {
                     amount: jobData.amount,
-                    maxCreepAssignments: jobData.maxCreepAssignments,
-                    wantedCreepParts: jobData.wantedCreepParts,
-                    ticksToClear: jobData.ticksToClear,
-                    roundTripTime: jobData.roundTripTime
+                    targetPos: jobData.targetPos,
+                    deliveryJobId: jobData.deliveryJobId
                 });
             }
+
+            // Decrease our temporary delivery capacity allocations
+            deliveryFreeById[chosenDeliveryId] -= alloc;
+            remainingDeliveryFree -= alloc;
         }
     }
 
@@ -374,7 +367,7 @@ export default class HaulingPartHandler {
             // But create separate jobs for large piles (200+ energy)
             if (nearSource && resource.amount < 200) continue;
 
-            const jobId = `haul-dropped-${resource.id}`;
+            const jobId = `pickup-dropped-${resource.id}`;
             const existingJob = this.jobsRoomPartHandler.getJobById(jobId);
 
             const reservedAmount = existingJob ? (existingJob.totalReserved || 0) : 0;
@@ -401,33 +394,29 @@ export default class HaulingPartHandler {
             const neededCarryParts = demand.wantedCarryParts;
 
             if (!existingJob) {
-                const jobData = {
-                    id: jobId,
-                    objectId: resource.id,
-                    type: "pickup",
-                    resourceType: "dropped",
-                    resource: resource.resourceType, // Specify which resource to haul
-                    creepType: "hauler",
-                    startRoom: this.room.name,
-                    targetPos: { x: resource.pos.x, y: resource.pos.y, roomName: resource.pos.roomName },
-                    amount: resource.amount,
-                    capacityType: 'fixed',
-                    maxCreepAssignments: maxCreepsNeeded,
-                    wantedCreepParts: { CARRY: neededCarryParts, MOVE: neededCarryParts },
-                    minJobTime: 0,
-                    ticksToClear: demand.ticksToClear,
-                    roundTripTime: demand.roundTripTime
-                };
-                this.jobsRoomPartHandler.createJob(jobData);
+                // Create a hidden pickup job for this dropped resource and link to a delivery job with capacity
+                const deliveryJobs = this.jobsRoomPartHandler.getJobsByType('delivery') || [];
+                const dj = deliveryJobs.find(d => (d.freeCapacity || 0) > 0);
+                if (dj) {
+                    const pickupJobId = `pickup-dropped-${resource.id}`;
+                    const jobData = {
+                        id: pickupJobId,
+                        type: 'pickup',
+                        resource: RESOURCE_ENERGY,
+                        creepType: 'hauler',
+                        startRoom: this.room.name,
+                        amount: resource.amount,
+                        objectId: resource.id,
+                        targetPos: { x: resource.pos.x, y: resource.pos.y, roomName: resource.pos.roomName },
+                        hidden: true,
+                        deliveryJobId: dj.id,
+                        wantedCreepParts: {}
+                    };
+                    this.jobsRoomPartHandler.createJob(jobData);
+                }
             } else {
-                // Update amount and parts in case it changed
-                this.jobsRoomPartHandler.updateJob(jobId, {
-                    amount: resource.amount,
-                    wantedCreepParts: { CARRY: neededCarryParts, MOVE: neededCarryParts },
-                    maxCreepAssignments: maxCreepsNeeded,
-                    ticksToClear: demand.ticksToClear,
-                    roundTripTime: demand.roundTripTime
-                });
+                // Keep existing pickup jobs in sync with live pile
+                this.jobsRoomPartHandler.updateJob(existingJob.id, { amount: resource.amount });
             }
         }
     }
@@ -437,6 +426,14 @@ export default class HaulingPartHandler {
             filter: s => (s.structureType === STRUCTURE_CONTAINER || s.structureType === STRUCTURE_STORAGE)
                 && s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
         });
+
+        // Compute delivery job free capacities to allocate pickup jobs against.
+        const deliveryJobs = this.jobsRoomPartHandler.getJobsByType('delivery') || [];
+        const deliveryFreeById = {};
+        for (const dj of deliveryJobs) {
+            deliveryFreeById[dj.id] = dj.freeCapacity || 0;
+        }
+        let remainingDeliveryFree = Object.values(deliveryFreeById).reduce((s, v) => s + v, 0);
 
         for (const container of containers) {
             // Source jobs handle source containers; delivery logic handles controller container.
@@ -479,40 +476,66 @@ export default class HaulingPartHandler {
                 continue;
             }
 
+            // If there's no delivery capacity, don't create pickup jobs from containers.
+            if (remainingDeliveryFree <= 0) {
+                if (existingJob && reservedAmount === 0) this.deleteJob(existingJob);
+                continue;
+            }
+
             // Calculate needed CARRY parts based on available amount
             const demand = this.getSoftHaulDemand(container.pos, availableAmount, existingJob);
             const maxCreepsNeeded = demand.desiredHaulers;
             const neededCarryParts = demand.wantedCarryParts;
 
-            if (!existingJob) {
-                const jobData = {
-                    id: jobId,
-                    objectId: container.id,
-                    type: "pickup",
-                    resourceType: "structure",
-                    resource: RESOURCE_ENERGY, // Specify which resource to haul (can be changed for other resources)
-                    creepType: "hauler",
-                    startRoom: this.room.name,
-                    targetPos: { x: container.pos.x, y: container.pos.y, roomName: container.pos.roomName },
-                    amount: amount,
-                    capacityType: 'fixed',
-                    maxCreepAssignments: maxCreepsNeeded,
-                    wantedCreepParts: { CARRY: neededCarryParts, MOVE: neededCarryParts },
-                    minJobTime: 0,
-                    ticksToClear: demand.ticksToClear,
-                    roundTripTime: demand.roundTripTime
-                };
+            // Find a delivery job with available capacity
+            let chosenDeliveryId = null;
+            for (const id in deliveryFreeById) {
+                if (deliveryFreeById[id] > 0) {
+                    chosenDeliveryId = id;
+                    break;
+                }
+            }
+
+            if (!chosenDeliveryId) {
+                if (existingJob && reservedAmount === 0) this.deleteJob(existingJob);
+                continue;
+            }
+
+            const alloc = Math.min(availableAmount, deliveryFreeById[chosenDeliveryId], remainingDeliveryFree);
+            if (alloc <= 0) {
+                if (existingJob && reservedAmount === 0) this.deleteJob(existingJob);
+                continue;
+            }
+
+            // Create a hidden pickup job for this container and link it to the chosen delivery job
+            const pickupJobId = `pickup-container-${container.id}`;
+            const existingPickup = this.jobsRoomPartHandler.getJobById(pickupJobId);
+            const jobData = {
+                id: pickupJobId,
+                type: 'pickup',
+                resource: RESOURCE_ENERGY,
+                creepType: 'hauler',
+                startRoom: this.room.name,
+                amount: alloc,
+                objectId: container.id,
+                targetPos: { x: container.pos.x, y: container.pos.y, roomName: container.pos.roomName },
+                hidden: true,
+                deliveryJobId: chosenDeliveryId,
+                wantedCreepParts: {}
+            };
+
+            if (!existingPickup) {
                 this.jobsRoomPartHandler.createJob(jobData);
             } else {
-                // Update amount and parts based on current container contents
-                this.jobsRoomPartHandler.updateJob(jobId, {
-                    amount: amount,
-                    wantedCreepParts: { CARRY: neededCarryParts, MOVE: neededCarryParts },
-                    maxCreepAssignments: maxCreepsNeeded,
-                    ticksToClear: demand.ticksToClear,
-                    roundTripTime: demand.roundTripTime
+                this.jobsRoomPartHandler.updateJob(pickupJobId, {
+                    amount: jobData.amount,
+                    targetPos: jobData.targetPos,
+                    deliveryJobId: jobData.deliveryJobId
                 });
             }
+
+            deliveryFreeById[chosenDeliveryId] -= alloc;
+            remainingDeliveryFree -= alloc;
         }
     }
 }

@@ -64,9 +64,8 @@ export default class VisualsPartHandler {
 
         const storage = this.room.storage;
         const storedEnergy = storage ? (storage.store[RESOURCE_ENERGY] || 0) : null;
-        const bootstrap = this.jobsRoomPartHandler.isEmergencyBootstrap();
 
-        return { energyState, energy, capacity, fill, fillPct, storedEnergy, bootstrap };
+        return { energyState, energy, capacity, fill, fillPct, storedEnergy };
     }
 
     drawOverviewHUD() {
@@ -99,10 +98,6 @@ export default class VisualsPartHandler {
         leftY += 0.5;
         if (es.storedEnergy !== null) {
             this._hudText(`Storage: ${es.storedEnergy}`, leftX, leftY, { color: '#cccccc' });
-            leftY += 0.5;
-        }
-        if (es.energyState === 'startup') {
-            this._hudText(`Bootstrap: ${es.bootstrap ? 'ON' : 'off'}`, leftX, leftY, { color: es.bootstrap ? '#ffaaaa' : '#888888' });
             leftY += 0.5;
         }
 
@@ -518,17 +513,11 @@ export default class VisualsPartHandler {
             const assignedCount = Object.keys(job.assignedCreepIds || {}).length;
             const pendingCount = Object.keys(job.pendingCreepIds || {}).length;
 
-            // For delivery jobs with reservations, show actual capacity status
-            let maxAssignments = job.maxCreepAssignments;
-            if (maxAssignments === undefined) {
-                if (job.type === 'delivery' && job.freeCapacity !== undefined) {
-                    const totalReserved = job.totalReserved || 0;
-                    const remainingCapacity = Math.max(0, job.freeCapacity - totalReserved);
-                    maxAssignments = remainingCapacity > 0 ? -1 : '∞';
-                } else {
-                    maxAssignments = '∞';
-                }
-            }
+                const maxAssignments = job.maxCreepAssignments === undefined ? 
+                    (job.type === 'pickup' ? assignedCount : 
+                    (job.type === 'delivery' && job.freeCapacity !== undefined ? 
+                        Math.max(0, job.freeCapacity - (job.totalReserved || 0)) > 0 ? -1 : '∞' : 
+                    '∞')) : job.maxCreepAssignments;
 
             let icon = '❓';
             let color = '#ffffff';
@@ -547,8 +536,10 @@ export default class VisualsPartHandler {
             }
 
             // Job name and counts
+            const hasDefinedMax = job.maxCreepAssignments !== undefined;
+            const countsText = hasDefinedMax ? `[${assignedCount}/${maxAssignments}] +${pendingCount}` : `${assignedCount}`;
             this.room.visual.text(
-                `${icon} ${job.type} [${assignedCount}/${maxAssignments}] +${pendingCount}`,
+                `${icon} ${job.type} ${countsText}`,
                 1, y,
                 {
                     align: 'left',
@@ -611,7 +602,6 @@ export default class VisualsPartHandler {
         const storedEnergy = storage ? storage.store[RESOURCE_ENERGY] : 0;
         const fill = capacity > 0 ? (energy / capacity) : 0;
         const fillPct = Math.floor(fill * 100);
-        const bootstrap = this.jobsRoomPartHandler.isEmergencyBootstrap();
 
         let stateIcon = '⚡';
         let stateColor = '#00ff00';
@@ -668,20 +658,6 @@ export default class VisualsPartHandler {
                 strokeWidth: 0.05
             }
         );
-
-        if (energyState === 'startup') {
-            this.room.visual.text(
-                `Bootstrap: ${bootstrap ? 'ON' : 'off'}`,
-                25, 3.25,
-                {
-                    align: 'left',
-                    font: 0.45,
-                    color: bootstrap ? '#ffaaaa' : '#888888',
-                    stroke: '#000000',
-                    strokeWidth: 0.05
-                }
-            );
-        }
 
         // Storage
         if (storage) {
@@ -1275,7 +1251,9 @@ export default class VisualsPartHandler {
                 // Handle jobs with reservation system (delivery jobs)
                 let maxAssign = job.maxCreepAssignments;
                 if (maxAssign === undefined) {
-                    if (job.type === 'delivery' && job.freeCapacity !== undefined) {
+                    if (job.type === 'pickup') {
+                        maxAssign = assignedCount;
+                    } else if (job.type === 'delivery' && job.freeCapacity !== undefined) {
                         const totalReserved = job.totalReserved || 0;
                         const remainingCapacity = Math.max(0, job.freeCapacity - totalReserved);
                         maxAssign = remainingCapacity > 0 ? -1 : '∞';
@@ -1295,8 +1273,10 @@ export default class VisualsPartHandler {
                 }
 
                 const priority = JobsManager.calculateEffectivePriority(this.room, job);
+                const hasDefinedMaxH = job.maxCreepAssignments !== undefined;
+                const countsTextH = hasDefinedMaxH ? `[${assignedCount}+${pendingCount}/${maxAssign}]` : `${assignedCount}`;
                 this.room.visual.text(
-                    `${statusIcon} [${assignedCount}+${pendingCount}/${maxAssign}] P${priority}`,
+                    `${statusIcon} ${countsTextH} P${priority}`,
                     graphX, detailY,
                     {
                         align: 'left',
@@ -1369,14 +1349,19 @@ export default class VisualsPartHandler {
                 // Handle jobs with reservation system (delivery and pickup jobs)
                 let maxAssign = job.maxCreepAssignments;
                 if (maxAssign === undefined) {
-                    if (job.type === 'delivery' && job.freeCapacity !== undefined) {
+                    if (job.type === 'pickup') {
+                        maxAssign = assignedCount;
+                    } else if (job.type === 'delivery' && job.freeCapacity !== undefined) {
                         const totalReserved = job.totalReserved || 0;
                         const remainingCapacity = Math.max(0, job.freeCapacity - totalReserved);
                         maxAssign = remainingCapacity > 0 ? -1 : '∞';
-                    } else if (job.type === 'pickup' && job.amount !== undefined) {
-                        const totalReserved = job.totalReserved || 0;
-                        const remainingAmount = Math.max(0, job.amount - totalReserved);
-                        maxAssign = remainingAmount > 0 ? -1 : '∞';
+                    } else if (job.type === 'delivery' && job.sources && job.sources.length > 0) {
+                        // delivery job exposing sources behaves like pickup capacity
+                        let totalAvailable = 0;
+                        for (const s of job.sources) {
+                            totalAvailable += Math.max(0, (s.amount || 0) - (s.totalReserved || 0));
+                        }
+                        maxAssign = totalAvailable > 0 ? -1 : '∞';
                     } else {
                         maxAssign = '∞';
                     }
@@ -1408,8 +1393,10 @@ export default class VisualsPartHandler {
                     progressText = ` ${progressPercent}%`;
                 }
 
+                const hasDefinedMax2 = job.maxCreepAssignments !== undefined;
+                const countsText2 = hasDefinedMax2 ? `[${assignedCount}+${pendingCount}/${maxAssign}]` : `${assignedCount}`;
                 this.room.visual.text(
-                    `${statusIcon} ${typeLabel} ${amount}E${progressText} [${assignedCount}+${pendingCount}/${maxAssign}] P${priority}`,
+                    `${statusIcon} ${typeLabel} ${amount}E${progressText} ${countsText2} P${priority}`,
                     graphX, detailY,
                     {
                         align: 'left',
@@ -1953,10 +1940,12 @@ export default class VisualsPartHandler {
                     const totalReserved = job.totalReserved || 0;
                     const remainingCapacity = Math.max(0, job.freeCapacity - totalReserved);
                     maxAssignments = remainingCapacity > 0 ? -1 : '∞';
-                } else if (job.type === 'pickup' && job.amount !== undefined) {
-                    const totalReserved = job.totalReserved || 0;
-                    const remainingAmount = Math.max(0, job.amount - totalReserved);
-                    maxAssignments = remainingAmount > 0 ? -1 : '∞';
+                } else if (job.type === 'delivery' && job.sources && job.sources.length > 0) {
+                    let totalAvailable = 0;
+                    for (const s of job.sources) {
+                        totalAvailable += Math.max(0, (s.amount || 0) - (s.totalReserved || 0));
+                    }
+                    maxAssignments = totalAvailable > 0 ? -1 : '∞';
                 } else {
                     maxAssignments = '∞';
                 }
@@ -2035,10 +2024,12 @@ export default class VisualsPartHandler {
                     const totalReserved = job.totalReserved || 0;
                     const remainingCapacity = Math.max(0, job.freeCapacity - totalReserved);
                     maxAssignments = remainingCapacity > 0 ? -1 : '∞';
-                } else if (job.type === 'pickup' && job.amount !== undefined) {
-                    const totalReserved = job.totalReserved || 0;
-                    const remainingAmount = Math.max(0, job.amount - totalReserved);
-                    maxAssignments = remainingAmount > 0 ? -1 : '∞';
+                } else if (job.type === 'delivery' && job.sources && job.sources.length > 0) {
+                    let totalAvailable = 0;
+                    for (const s of job.sources) {
+                        totalAvailable += Math.max(0, (s.amount || 0) - (s.totalReserved || 0));
+                    }
+                    maxAssignments = totalAvailable > 0 ? -1 : '∞';
                 } else {
                     maxAssignments = '∞';
                 }

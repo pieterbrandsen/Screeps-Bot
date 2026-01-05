@@ -1,4 +1,5 @@
 import MoveTask from "./moveTask.js";
+import PickupTask from "./pickupTask.js";
 import Debug from "../../debug/debug.js";
 
 /**
@@ -9,8 +10,70 @@ export default class DeliveryTask {
         const resourceToDeliver = job.resource || RESOURCE_ENERGY;
         const carried = creep.store.getUsedCapacity(resourceToDeliver);
 
-        // If empty, job is complete
+        // If empty, try to pick up from job.sources (combined haul model)
         if (carried === 0) {
+            if (job.sources && job.sources.length > 0) {
+                // prefer creep-assigned subtarget
+                let source = null;
+                if (creep.memory.jobSubTarget && creep.memory.jobSubTarget.id) {
+                    source = job.sources.find(s => s.id === creep.memory.jobSubTarget.id);
+                }
+                if (!source) {
+                    // choose nearest available source with remaining amount
+                    let best = null;
+                    let bestDist = Infinity;
+                    for (const s of job.sources) {
+                        const available = Math.max(0, (s.amount || 0) - (s.totalReserved || 0));
+                        if (available <= 0) continue;
+                        let pos = s.targetPos || null;
+                        let dist = Infinity;
+                        if (pos) dist = creep.pos.getRangeTo(pos.x, pos.y);
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            best = s;
+                        }
+                    }
+                    source = best;
+                }
+
+                if (source) {
+                    const syntheticPickupJob = {
+                        id: `${job.id}-source-${source.id}`,
+                        type: 'pickup',
+                        objectId: source.objectId || null,
+                        targetPos: source.targetPos || null,
+                        amount: Math.max(0, (source.amount || 0) - (source.totalReserved || 0)),
+                        resource: job.resource || RESOURCE_ENERGY,
+                        resourceType: source.type || 'source',
+                        creepType: 'hauler',
+                        startRoom: job.startRoom
+                    };
+
+                    const pickupComplete = PickupTask.execute(creep, syntheticPickupJob);
+                    // If pickup task is still in progress, wait
+                    if (!pickupComplete) return false;
+                    // After successful pickup, update source bookkeeping on the parent job
+                    const picked = creep.store.getUsedCapacity(resourceToDeliver);
+                    if (picked > 0) {
+                        // find the source entry and decrement its amount
+                        const idx = job.sources.findIndex(s => s.id === source.id);
+                        if (idx !== -1) {
+                            job.sources[idx].amount = Math.max(0, (job.sources[idx].amount || 0) - picked);
+                            // Persist change
+                            if (job.id) {
+                                // Update job in memory via JobsManager-less API: mutate Memory directly
+                                const jobs = Memory.jobs[job.startRoom] || [];
+                                const dj = jobs.find(j => j.id === job.id);
+                                if (dj) {
+                                    dj.sources = job.sources;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // No sources or nothing picked up -> complete
             creep.say('✅');
             Debug.log(creep.room.name, 'info', `delivery:complete ${creep.name} empty`, { jobId: job.id });
             return true;

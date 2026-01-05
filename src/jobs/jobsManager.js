@@ -89,7 +89,7 @@ export default class JobsManager {
             return j;
         });
         const harvestJobs = jobs.filter(j => j.type === 'harvest');
-        const haulJobs = jobs.filter(j => j.type === 'delivery' || j.type === 'pickup');
+        const haulJobs = jobs.filter(j => j.type === 'delivery');
 
         const harvesterCount = harvestJobs.reduce((sum, j) =>
             sum + Object.keys(j.assignedCreepIds || {}).length, 0);
@@ -107,7 +107,7 @@ export default class JobsManager {
             if (bootstrapHarvesters && job.type === 'harvest') {
                 priority = 1; // Critical - get energy flowing
             }
-            else if (!bootstrapHarvesters && bootstrapHaulers && (job.type === 'delivery' || job.type === 'pickup')) {
+            else if (!bootstrapHarvesters && bootstrapHaulers && job.type === 'delivery') {
                 priority = 1; // Critical - get energy flowing
             }
         }
@@ -123,15 +123,6 @@ export default class JobsManager {
                     priority = 2; // High - replenishing spawn
                 } else {
                     priority = 3; // Normal hauling
-                }
-            } else if (job.type === 'pickup') {
-                // Pickup priority based on resource type and amount
-                if (job.resourceType === 'dropped') {
-                    priority = 2; // High priority for large drops
-                } else if (job.resourceType === 'container') {
-                    priority = 3; // Normal container pickup
-                } else {
-                    priority = 4; // Lower priority for other pickups
                 }
             } else if (job.type === 'build') {
                 const constructionSite = Game.getObjectById(job.objectId);
@@ -187,6 +178,198 @@ export default class JobsManager {
         }
 
         return Math.max(1, priority);
+    }
+
+    // Assign a creep to a job (handles reservations and bookkeeping)
+    static assignJobToCreep(job, creep) {
+        if (!job || !creep) return;
+
+        // Ensure bookkeeping structures
+        job.assignedCreepIds = job.assignedCreepIds || {};
+        job.assignedObjectIds = job.assignedObjectIds || {};
+        job.assignedCreepParts = job.assignedCreepParts || {};
+        job.reservations = job.reservations || {};
+        job.totalReserved = job.totalReserved || 0;
+
+        // Handle reservation for pickup jobs or delivery jobs
+        let totalNewReserved = 0;
+
+        // Pickup jobs: reserve directly from the pickup job and mirror reservation on linked delivery
+        if (job.type === 'pickup') {
+            const resource = job.resource || RESOURCE_ENERGY;
+            const creepFree = creep.store.getFreeCapacity(resource);
+            const available = Math.max(0, (job.amount || 0) - (job.totalReserved || 0));
+            const reserveAmount = Math.min(creepFree, available);
+            if (reserveAmount > 0) {
+                job.reservations[creep.name] = (job.reservations[creep.name] || 0) + reserveAmount;
+                job.totalReserved = (job.totalReserved || 0) + reserveAmount;
+                totalNewReserved += reserveAmount;
+
+                // Mark creep memory sub-target
+                creep.memory.jobSubTarget = { type: 'pickup', id: job.id };
+
+                // If this pickup is linked to a delivery job, mirror reservation there so delivery can accept haulers
+                if (job.deliveryJobId) {
+                    const deliveryJobs = Memory.jobs[job.startRoom] || [];
+                    const djob = deliveryJobs.find(j => j.id === job.deliveryJobId);
+                    if (djob) {
+                        djob.reservations = djob.reservations || {};
+                        djob.totalReserved = (djob.totalReserved || 0) + reserveAmount;
+                        djob.reservations[creep.name] = (djob.reservations[creep.name] || 0) + reserveAmount;
+                    }
+                }
+            }
+        }
+
+        if (job.type === 'delivery') {
+            const resource = job.resource || RESOURCE_ENERGY;
+            const creepCarried = creep.store.getUsedCapacity(resource);
+            if (creepCarried > 0) {
+                job.reservations[creep.name] = (job.reservations[creep.name] || 0) + creepCarried;
+                job.totalReserved = (job.totalReserved || 0) + creepCarried;
+                totalNewReserved += creepCarried;
+            }
+
+            // If this delivery job has source sub-targets, and the creep has free capacity, reserve from a source
+            const creepFree = creep.store.getFreeCapacity(resource);
+            if (creepFree > 0 && job.sources && job.sources.length > 0) {
+                // Find a source with available amount (prefer nearest)
+                let bestIndex = -1;
+                let bestDist = Infinity;
+                for (let i = 0; i < job.sources.length; i++) {
+                    const s = job.sources[i];
+                    const sAvailable = Math.max(0, (s.amount || 0) - (s.totalReserved || 0));
+                    if (sAvailable <= 0) continue;
+
+                    let pos = null;
+                    if (s.targetPos) pos = s.targetPos;
+                    else if (s.objectId) {
+                        const obj = Game.getObjectById(s.objectId);
+                        if (obj && obj.pos) pos = obj.pos;
+                    }
+                    let dist = Infinity;
+                    if (pos) {
+                        dist = creep.pos.getRangeTo(pos.x, pos.y);
+                    }
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIndex = i;
+                    }
+                }
+
+                if (bestIndex !== -1) {
+                    const source = job.sources[bestIndex];
+                    const sAvailable = Math.max(0, (source.amount || 0) - (source.totalReserved || 0));
+                    const reserveAmount = Math.min(sAvailable, creepFree);
+                    if (reserveAmount > 0) {
+                        source.reservations = source.reservations || {};
+                        source.reservations[creep.name] = (source.reservations[creep.name] || 0) + reserveAmount;
+                        source.totalReserved = (source.totalReserved || 0) + reserveAmount;
+
+                        // Also track at job-level for simplicity
+                        job.reservations[creep.name] = (job.reservations[creep.name] || 0) + reserveAmount;
+                        job.totalReserved = (job.totalReserved || 0) + reserveAmount;
+                        totalNewReserved += reserveAmount;
+
+                        // Mark creep memory sub-target
+                        creep.memory.jobSubTarget = { type: 'source', id: source.id };
+                    }
+                }
+            }
+        }
+
+        // Legacy pickup jobs are handled elsewhere; new model uses delivery.sources
+
+        // If no reservation was created and creep carries nothing, don't assign
+        if (((job.type === 'delivery') || (job.type === 'pickup')) && totalNewReserved === 0) {
+            return 0;
+        }
+
+        // Perform assignment bookkeeping
+        job.assignedCreepIds[creep.name] = Game.time;
+        if (creep.id) job.assignedObjectIds[creep.id] = creep.name;
+
+        const creepParts = creep.body.reduce((acc, part) => {
+            if (!part.hits) return acc;
+            const type = part.type.toUpperCase();
+            acc[type] = (acc[type] || 0) + 1;
+            return acc;
+        }, {});
+        for (const partType in creepParts) {
+            const count = creepParts[partType];
+            job.assignedCreepParts[partType] = (job.assignedCreepParts[partType] || 0) + count;
+        }
+
+        // Update creep memory
+        creep.memory.jobId = job.id;
+        creep.memory.jobRoom = job.startRoom;
+        return totalNewReserved;
+    }
+
+    // Unassign a creep from a job (releases reservations and bookkeeping)
+    static unassignJobFromCreep(job, creep) {
+        if (!job || !creep) return;
+
+        job.reservations = job.reservations || {};
+        job.totalReserved = job.totalReserved || 0;
+
+        // Release reservation for this creep
+        if (job.reservations && job.reservations[creep.name]) {
+            const amount = job.reservations[creep.name];
+            delete job.reservations[creep.name];
+            job.totalReserved = Math.max(0, (job.totalReserved || 0) - amount);
+        }
+
+        // If this was a hidden pickup linked to a delivery, also release mirrored reservation on delivery
+        if (job.type === 'pickup' && job.deliveryJobId) {
+            const deliveryJobs = Memory.jobs[job.startRoom] || [];
+            const djob = deliveryJobs.find(j => j.id === job.deliveryJobId);
+            if (djob && djob.reservations && djob.reservations[creep.name]) {
+                const damount = djob.reservations[creep.name];
+                delete djob.reservations[creep.name];
+                djob.totalReserved = Math.max(0, (djob.totalReserved || 0) - damount);
+            }
+        }
+
+        // Release any source-level reservations if present
+        if (job.sources && job.sources.length > 0) {
+            for (const s of job.sources) {
+                if (s.reservations && s.reservations[creep.name]) {
+                    const samount = s.reservations[creep.name];
+                    delete s.reservations[creep.name];
+                    s.totalReserved = Math.max(0, (s.totalReserved || 0) - samount);
+                    // Also decrement job-level totalReserved if it was counted there
+                    job.totalReserved = Math.max(0, (job.totalReserved || 0) - samount);
+                }
+            }
+        }
+
+        // Remove assigned creep bookkeeping
+        if (job.assignedCreepIds && job.assignedCreepIds[creep.name]) {
+            delete job.assignedCreepIds[creep.name];
+            if (creep.id && job.assignedObjectIds) {
+                delete job.assignedObjectIds[creep.id];
+            }
+            if (job.assignedCreepParts) {
+                const creepParts = creep.body.reduce((acc, part) => {
+                    if (!part.hits) return acc;
+                    const type = part.type.toUpperCase();
+                    acc[type] = (acc[type] || 0) + 1;
+                    return acc;
+                }, {});
+                for (const partType in creepParts) {
+                    const count = creepParts[partType];
+                    job.assignedCreepParts[partType] = Math.max(0, (job.assignedCreepParts[partType] || 0) - count);
+                }
+            }
+        }
+
+        // Clear creep memory
+        delete creep.memory.jobId;
+        delete creep.memory.jobRoom;
+        delete creep.memory.haulState;
+        delete creep.memory.jobSubTarget;
+        return job;
     }
 }
 
